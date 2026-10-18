@@ -335,6 +335,49 @@ def test_provider_error_classes() -> None:
     )
 
 
+def test_quick_check_rejects_a_bad_key_and_runs_the_audit_for_the_master_pass(
+    mock_client: TestClient,
+) -> None:
+    denied = mock_client.get(
+        "/v1/quick-check",
+        params={
+            "domain": "example.com",
+            "brand": "Example",
+            "keyword": "example pricing",
+            "key": "wrong-pass",
+        },
+    )
+    assert denied.status_code == 401
+
+    allowed = mock_client.get(
+        "/v1/quick-check",
+        params={
+            "domain": "https://www.Example.com/pricing",
+            "brand": "Example",
+            "keyword": "example pricing",
+            "key": "indexgrid_master_2026_pass",
+        },
+    )
+    assert allowed.status_code == 200
+    assert allowed.content.endswith(b"\n")
+    body = allowed.json()
+    assert body["keywords_processed"] == 1
+    assert body["results"]["example pricing"]["vibe_share_score"] == 100.0
+
+    invalid = mock_client.get(
+        "/v1/quick-check",
+        params={
+            "domain": "not a host",
+            "brand": "Example",
+            "keyword": "example pricing",
+            "key": "indexgrid_master_2026_pass",
+        },
+    )
+    assert invalid.status_code == 422
+    assert "hostname" in invalid.json()["detail"]
+    assert invalid.content.endswith(b"\n")
+
+
 def test_audit_json_ends_with_a_newline(mock_client: TestClient) -> None:
     response = mock_client.post(
         "/v1/audit",

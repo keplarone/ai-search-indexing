@@ -27,6 +27,14 @@ curl -s http://127.0.0.1:8741/v1/audit \
   }'
 ```
 
+One keyword can also be audited from a browser. `GET /v1/quick-check` takes `domain`, `brand`, `keyword`, and `key`. The key must match the master pass. A mismatch returns 401 and does not call the providers. A match runs the same audit as `POST /v1/audit` for that single keyword.
+
+```text
+http://127.0.0.1:8741/v1/quick-check?domain=example.com&brand=Example&keyword=example%20pricing&key=indexgrid_master_2026_pass
+```
+
+The key is a query parameter, so it is stored in browser history and in access logs.
+
 ## Request and response
 
 `AuditRequest` requires `client_domain`, `brand_name`, and `keywords`. A URL in `client_domain` is reduced to its hostname. Blank keywords are rejected. Exact duplicate keywords are removed. The default cap is 15 keywords (`MAX_KEYWORDS`).

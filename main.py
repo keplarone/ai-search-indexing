@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ from urllib.parse import quote_plus, urlparse
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from supabase import ClientOptions, create_client
 
 from billing import (
@@ -1920,6 +1921,41 @@ async def create_audit(
         _audit_transaction_batch(request, results),
     )
     return response
+
+
+_QUICK_CHECK_KEY = "indexgrid_master_2026_pass"
+
+
+@app.get("/v1/quick-check", response_model=AuditResponse, tags=["audit"])
+async def quick_check(
+    domain: str,
+    brand: str,
+    keyword: str,
+    key: str,
+    background_tasks: BackgroundTasks,
+) -> AuditResponse:
+    """Run one keyword audit from a single browser URL.
+
+    The key query parameter must match the IndexGrid master pass. The
+    domain, brand, and keyword are then handed to the same multi-model
+    audit used by POST /v1/audit.
+    """
+
+    if not hmac.compare_digest(key, _QUICK_CHECK_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        audit_request = AuditRequest(
+            client_domain=domain,
+            brand_name=brand,
+            keywords=[keyword],
+        )
+    except ValidationError as exc:
+        detail = "; ".join(
+            str(err.get("msg", "invalid request")).removeprefix("Value error, ")
+            for err in exc.errors()
+        )
+        raise HTTPException(status_code=422, detail=detail or "invalid request") from exc
+    return await create_audit(audit_request, background_tasks)
 
 
 def _port() -> int:
