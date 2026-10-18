@@ -32,6 +32,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from supabase import ClientOptions, create_client
 
 from billing import (
     bill_completed_audit,
@@ -1526,6 +1527,229 @@ async def _audit_single_keyword(
 
 
 # ---------------------------------------------------------------------------
+# Supabase transaction log and competitor alerts
+# ---------------------------------------------------------------------------
+
+_AUDIT_TRANSACTION_KEYS: tuple[str, ...] = (
+    "client_domain",
+    "brand_name",
+    "keyword_queried",
+    "vibe_share_score",
+    "competitors_detected",
+    "openai_status",
+    "perplexity_status",
+)
+_supabase_client: Any = None
+
+
+def _supabase_credentials() -> tuple[str, str]:
+    url = str(os.environ.get("SUPABASE_URL") or "").strip()
+    key = str(
+        os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SECRET_KEY") or ""
+    ).strip()
+    if not url or not key:
+        raise RuntimeError("Supabase is not configured")
+    return url, key
+
+
+def _get_supabase_client() -> Any:
+    """Return the process Supabase client. Created on first use."""
+
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    url, key = _supabase_credentials()
+    _supabase_client = create_client(
+        url,
+        key,
+        options=ClientOptions(
+            postgrest_client_timeout=10,
+            storage_client_timeout=10,
+            function_client_timeout=10,
+        ),
+    )
+    return _supabase_client
+
+
+def _provider_field(metrics: KeywordMetrics, provider: str, field: str) -> Any:
+    for item in metrics.providers:
+        if item.provider == provider:
+            return getattr(item, field)
+    return "failed" if field == "status" else []
+
+
+def _audit_transaction_batch(
+    request: AuditRequest, results: dict[str, KeywordMetrics]
+) -> list[dict[str, Any]]:
+    """One insert payload per keyword, plus the Perplexity names used by alerts."""
+
+    batch: list[dict[str, Any]] = []
+    for keyword, metrics in results.items():
+        perplexity_competitors = [
+            name
+            for name in _provider_field(metrics, "perplexity", "competitors")
+            if isinstance(name, str) and name.strip()
+        ]
+        batch.append(
+            {
+                "client_domain": request.client_domain,
+                "brand_name": request.brand_name,
+                "keyword_queried": keyword,
+                "vibe_share_score": metrics.vibe_share_score,
+                "competitors_detected": list(metrics.competitors),
+                "openai_status": str(_provider_field(metrics, "openai", "status")),
+                "perplexity_status": str(
+                    _provider_field(metrics, "perplexity", "status")
+                ),
+                "perplexity_competitors": perplexity_competitors,
+            }
+        )
+    return batch
+
+
+def _configured_competitor_whitelist() -> set[str]:
+    raw = os.environ.get("COMPETITOR_WHITELIST", "")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _names_from_stored_competitors(value: Any) -> set[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = [part.strip() for part in value.split(",") if part.strip()]
+    if not isinstance(value, list):
+        return set()
+    return {str(item).strip().lower() for item in value if str(item).strip()}
+
+
+def _historical_competitor_whitelist(client_domain: str) -> set[str]:
+    """Names already archived for this domain, plus COMPETITOR_WHITELIST."""
+
+    names = _configured_competitor_whitelist()
+    response = (
+        _get_supabase_client()
+        .table("audit_transactions")
+        .select("competitors_detected")
+        .eq("client_domain", client_domain)
+        .execute()
+    )
+    for row in response.data or []:
+        if isinstance(row, dict):
+            names.update(
+                _names_from_stored_competitors(row.get("competitors_detected"))
+            )
+    return names
+
+
+def _insert_audit_transaction(row: dict[str, Any]) -> None:
+    payload = {key: row[key] for key in _AUDIT_TRANSACTION_KEYS}
+    _get_supabase_client().table("audit_transactions").insert(payload).execute()
+
+
+def dispatch_critical_brand_alert(
+    brand_name: str,
+    keyword: str,
+    vibe_share_score: float,
+    openai_status: str,
+    perplexity_status: str,
+    perplexity_competitors: list[str],
+    new_competitors: list[str],
+) -> None:
+    """Write a high-urgency displacement alert to the root error log."""
+
+    if vibe_share_score == 0.0:
+        subject = (
+            f"🚨 INDEXGRID ALERT: {brand_name} has dropped to 0% Visibility "
+            f"for '{keyword}'"
+        )
+    else:
+        subject = (
+            f"🚨 INDEXGRID ALERT: {brand_name} has a new competitor "
+            f"displacement for '{keyword}'"
+        )
+    competitor_line = ", ".join(perplexity_competitors) or "none listed"
+    new_line = ", ".join(new_competitors) or "none"
+    content = "\n".join(
+        [
+            subject,
+            f"Brand: {brand_name}",
+            f"Keyword: {keyword}",
+            f"Vibe-Share Score: {vibe_share_score}",
+            f"OpenAI status: {openai_status}",
+            f"Perplexity status: {perplexity_status}",
+            f"Perplexity competitors: {competitor_line}",
+            f"New competitors outside the historical whitelist: {new_line}",
+            (
+                "OpenAI and Perplexity are actively recommending competitors "
+                "instead of the client. Push an immediate diagnostic patch."
+            ),
+        ]
+    )
+    logging.error(content)  # noqa: LOG015 - alerts must hit the root error channel
+
+
+async def log_audit_to_supabase(rows: list[dict[str, Any]]) -> None:
+    """Archive each keyword after the response has already been sent.
+
+    A Supabase timeout is logged and swallowed. The audit JSON is not involved.
+    """
+
+    for row in rows:
+        whitelist: set[str] = _configured_competitor_whitelist()
+        try:
+            whitelist = await asyncio.to_thread(
+                _historical_competitor_whitelist,
+                str(row.get("client_domain") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - history lookup must not block alerts
+            _log(
+                logging.ERROR,
+                "supabase competitor history failed",
+                error_type=exc.__class__.__name__,
+                error_message=_redact_provider_text(str(exc)),
+            )
+        try:
+            await asyncio.to_thread(_insert_audit_transaction, row)
+        except Exception as exc:  # noqa: BLE001 - database loss must not surface to clients
+            _log(
+                logging.ERROR,
+                "supabase audit log failed",
+                error_type=exc.__class__.__name__,
+                error_message=_redact_provider_text(str(exc)),
+                client_domain=row.get("client_domain"),
+                keyword=row.get("keyword_queried"),
+            )
+        perplexity_competitors = [
+            name
+            for name in row.get("perplexity_competitors", [])
+            if isinstance(name, str)
+        ]
+        new_competitors = [
+            name for name in perplexity_competitors if name.lower() not in whitelist
+        ]
+        score = float(row.get("vibe_share_score") or 0.0)
+        if score == 0.0 or new_competitors:
+            try:
+                dispatch_critical_brand_alert(
+                    brand_name=str(row.get("brand_name") or ""),
+                    keyword=str(row.get("keyword_queried") or ""),
+                    vibe_share_score=score,
+                    openai_status=str(row.get("openai_status") or "failed"),
+                    perplexity_status=str(row.get("perplexity_status") or "failed"),
+                    perplexity_competitors=perplexity_competitors,
+                    new_competitors=new_competitors,
+                )
+            except Exception as exc:  # noqa: BLE001 - alerts are best-effort
+                _log(
+                    logging.ERROR,
+                    "brand alert failed",
+                    error_type=exc.__class__.__name__,
+                    error_message=_redact_provider_text(str(exc)),
+                )
+
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 
@@ -1682,12 +1906,16 @@ async def create_audit(
             for keyword, metrics in response.results.items()
         },
     )
-    # Billing runs after the response is sent. A Stripe or Supabase failure
-    # is recorded by the billing registry and does not change this payload.
+    # Billing and the transaction log run after the response is sent.
+    # A Supabase timeout must not change this payload.
     background_tasks.add_task(
         bill_completed_audit,
         request.client_domain,
         response.keywords_processed,
+    )
+    background_tasks.add_task(
+        log_audit_to_supabase,
+        _audit_transaction_batch(request, results),
     )
     return response
 
