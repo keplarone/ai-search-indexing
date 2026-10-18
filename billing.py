@@ -74,6 +74,49 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def load_local_env(path: Path | None = None) -> bool:
+    """Load the workspace ``.env`` into the process environment.
+
+    Existing variables win, so a secret injected by the platform is never
+    replaced by the file. Values are not logged.
+    """
+
+    env_path = path or Path(__file__).resolve().parent / ".env"
+    if not env_path.is_file():
+        return False
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+    return True
+
+
+# Apply the workspace file before any credential lookup.
+load_local_env()
+
+
+def _stripe_api_key() -> str:
+    """Stripe secret from the local environment.
+
+    ``STRIPE_API_KEY`` is the canonical name. ``STRIPE_SECRET_KEY`` is the
+    name already used in the workspace ``.env``.
+    """
+
+    return _env("STRIPE_API_KEY") or _env("STRIPE_SECRET_KEY")
+
+
 def _redact(value: str) -> str:
     """Remove credential-shaped strings before they reach logs or SQLite."""
 
@@ -97,7 +140,7 @@ def billing_status() -> dict[str, bool]:
     """Report which billing credentials are present. Values are booleans only."""
 
     return {
-        "stripe_configured": bool(_env("STRIPE_API_KEY")),
+        "stripe_configured": bool(_stripe_api_key()),
         "webhook_configured": bool(_env("STRIPE_WEBHOOK_SECRET")),
         "supabase_configured": bool(_env("SUPABASE_URL") and _supabase_key()),
     }
@@ -306,14 +349,15 @@ def record_billing_failure(
 
 
 def get_stripe_client() -> stripe.StripeClient:
-    """Return the process Stripe client, built from ``STRIPE_API_KEY``.
+    """Return the process Stripe client.
 
-    Use a restricted key (``rk_``) with permission to create subscription-item
-    usage records. The key is read from the environment and is never logged.
+    The key is read from ``STRIPE_API_KEY`` or, when that is unset, from
+    ``STRIPE_SECRET_KEY`` in the local environment. It is never logged.
+    Prefer a restricted key (``rk_``) with permission to create usage records.
     """
 
     global _stripe_client, _stripe_client_key
-    api_key = _env("STRIPE_API_KEY")
+    api_key = _stripe_api_key()
     if not api_key:
         raise RuntimeError("STRIPE_API_KEY is not configured")
     if _stripe_client is None or _stripe_client_key != api_key:

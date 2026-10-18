@@ -128,6 +128,21 @@ def _close_supabase(client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_local_stripe_secret_key_is_used_when_api_key_is_unset(monkeypatch) -> None:
+    monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_from_local_env")
+    billing._stripe_client = None
+    billing._stripe_client_key = None
+    monkeypatch.setattr(billing.stripe, "StripeClient", lambda key, **kwargs: {"key": key, **kwargs})
+    try:
+        client = billing.get_stripe_client()
+    finally:
+        billing._stripe_client = None
+        billing._stripe_client_key = None
+    assert client["key"] == "sk_test_from_local_env"
+    assert billing.billing_status()["stripe_configured"] is True
+
+
 def test_usage_report_increments_with_idempotency_key(registry, monkeypatch) -> None:
     fake = FakeStripe()
     monkeypatch.setattr(billing, "get_stripe_client", lambda: fake)
