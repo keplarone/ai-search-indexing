@@ -188,6 +188,101 @@ def test_all_providers_failed_scores_zero_and_names_every_index() -> None:
     )
 
 
+def test_partial_provider_failures_do_not_zero_a_real_citation() -> None:
+    metrics = main.calculate_keyword_metrics(
+        [
+            {
+                "provider": "openai",
+                "status": "success",
+                "cited": True,
+                "competitors": [],
+            },
+            {
+                "provider": "anthropic",
+                "status": "failed",
+                "cited": False,
+                "failure_reason": "workspace_required",
+            },
+            {
+                "provider": "gemini",
+                "status": "failed",
+                "cited": False,
+                "failure_reason": "schema_validation",
+            },
+            {
+                "provider": "perplexity",
+                "status": "success",
+                "cited": False,
+                "competitors": [f"Competitor {index}" for index in range(8)],
+            },
+        ]
+    )
+    assert metrics.total_successful_provider_responses == 2
+    assert metrics.successful_citations == 1
+    assert metrics.vibe_share_score == 50.0
+    assert len(metrics.competitors) == 8
+
+
+def test_measured_zero_keeps_competitor_evidence() -> None:
+    metrics = main.calculate_keyword_metrics(
+        [
+            {
+                "provider": "openai",
+                "status": "success",
+                "cited": False,
+                "competitors": [],
+            },
+            {"provider": "anthropic", "status": "failed", "cited": False},
+            {"provider": "gemini", "status": "failed", "cited": False},
+            {
+                "provider": "perplexity",
+                "status": "success",
+                "cited": False,
+                "competitors": [f"Competitor {index}" for index in range(8)],
+            },
+        ]
+    )
+    assert metrics.total_successful_provider_responses == 2
+    assert metrics.vibe_share_score == 0.0
+    assert len(metrics.competitors) == 8
+    assert metrics.providers[1].failure_reason is None
+
+
+def test_provider_error_classes() -> None:
+    assert main._provider_error_class(401, "Unauthorized") == "unauthorized"
+    assert (
+        main._provider_error_class(403, "Your project has been denied access.")
+        == "forbidden"
+    )
+    assert (
+        main._provider_error_class(
+            400,
+            "this request must include the anthropic-workspace-id header",
+        )
+        == "workspace_required"
+    )
+    assert (
+        main._provider_error_class(
+            400,
+            'Invalid value at generation_config.response_format.text.mime_type, "application/json"',
+        )
+        == "schema_validation"
+    )
+
+
+def test_audit_json_ends_with_a_newline(mock_client: TestClient) -> None:
+    response = mock_client.post(
+        "/v1/audit",
+        json={
+            "client_domain": "example.com",
+            "brand_name": "Example",
+            "keywords": ["example pricing"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.content.endswith(b"\n")
+
+
 def test_percentage_quantizes_repeating_fractions() -> None:
     assert main._percentage(1, 6) == 16.67
     assert main._percentage(2, 3) == 66.67
@@ -255,7 +350,17 @@ def test_invalid_domain_and_unknown_field_are_rejected(mock_client: TestClient) 
     assert unknown.status_code == 422
 
 
-def test_health_reports_mock_mode_without_keys(mock_client: TestClient) -> None:
+def test_health_reports_mock_mode_without_keys(
+    mock_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "PERPLEXITY_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
     response = mock_client.get("/health")
     assert response.status_code == 200
     body = response.json()
@@ -442,6 +547,8 @@ def test_live_requests_send_the_system_prompt_and_hide_the_gemini_key(
     assert gemini_request.headers["x-goog-api-key"] == "sk-test-gemini"
     gemini_body = json.loads(gemini_request.content)
     assert "temperature" not in gemini_body["generationConfig"]
+    assert gemini_body["generationConfig"]["responseMimeType"] == "application/json"
+    assert "responseFormat" not in gemini_body["generationConfig"]
     assert gemini_body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
     assert "Example" in gemini_body["system_instruction"]["parts"][0]["text"]
 
@@ -501,8 +608,16 @@ def test_markdown_fenced_json_and_http_500(monkeypatch: pytest.MonkeyPatch) -> N
         "evaluation_source": "live",
     }
     assert gemini["competitors"] == ["Fabrikam Cloud"]
-    assert anthropic == {"provider": "anthropic", "status": "failed", "cited": False}
-    assert perplexity == {"provider": "perplexity", "status": "failed", "cited": False}
+    assert anthropic["provider"] == "anthropic"
+    assert anthropic["status"] == "failed"
+    assert anthropic["cited"] is False
+    assert anthropic["failure_reason"] == "http_error"
+    assert perplexity == {
+        "provider": "perplexity",
+        "status": "failed",
+        "cited": False,
+        "failure_reason": "schema_validation",
+    }
 
 
 def test_provider_exception_does_not_fail_the_keyword(
@@ -546,7 +661,10 @@ def test_unknown_provider_and_missing_live_key(monkeypatch: pytest.MonkeyPatch) 
         )
     finally:
         _close_transport(client)
-    assert missing == {"provider": "openai", "status": "failed", "cited": False}
+    assert missing["provider"] == "openai"
+    assert missing["status"] == "failed"
+    assert missing["cited"] is False
+    assert missing["failure_reason"] == "missing_api_key"
 
 
 def test_local_auditor_is_stable_and_cites_direct_brand_mentions() -> None:

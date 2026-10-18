@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from billing import (
@@ -401,6 +402,7 @@ class ProviderResult(BaseModel):
     cited: bool
     competitors: list[str] = Field(default_factory=list)
     evaluation_source: Literal["live", "local_auditor"] | None = None
+    failure_reason: str | None = None
 
 
 class KeywordMetrics(BaseModel):
@@ -602,6 +604,11 @@ def _anthropic_request(
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
+    # Keys that are not scoped to one workspace are rejected until this header
+    # names the workspace. A missing value is logged as workspace_required.
+    workspace_id = _env("ANTHROPIC_WORKSPACE_ID")
+    if workspace_id:
+        headers["anthropic-workspace-id"] = workspace_id
     body: dict[str, Any] = {
         "model": _anthropic_model(),
         "max_tokens": 2048,
@@ -628,13 +635,23 @@ def _gemini_generation_config() -> dict[str, Any]:
     when an operator points GEMINI_MODEL at that generation.
     """
 
+    # responseFormat.text.mimeType rejects the MIME string "application/json"
+    # (it expects the enum APPLICATION_JSON) and the call dies as a 400 before
+    # any judgment is returned. responseMimeType is the field that accepts
+    # the MIME string alongside responseSchema.
     config: dict[str, Any] = {
         "maxOutputTokens": 1024,
-        "responseFormat": {
-            "text": {
-                "mimeType": "application/json",
-                "schema": _citation_json_schema(strict=False),
-            }
+        "responseMimeType": "application/json",
+        "responseSchema": {
+            "type": "object",
+            "properties": {
+                "cited": {"type": "boolean"},
+                "competitors": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["cited", "competitors"],
         },
     }
     model = _gemini_model()
@@ -740,14 +757,74 @@ def build_provider_request(
 # ---------------------------------------------------------------------------
 
 
-def _failed_result(provider: str) -> dict[str, Any]:
+def _failed_result(provider: str, failure_reason: str | None = None) -> dict[str, Any]:
     """Failure contract returned to the metrics engine.
 
-    The keys are exactly provider, status, and cited. Callers that need
-    competitors or an evaluation source apply their own defaults.
+    provider, status, and cited are always present. failure_reason is set
+    only when the call failed for a classified cause such as unauthorized
+    or schema_validation.
     """
 
-    return {"provider": provider, "status": "failed", "cited": False}
+    result: dict[str, Any] = {"provider": provider, "status": "failed", "cited": False}
+    if failure_reason:
+        result["failure_reason"] = failure_reason
+    return result
+
+
+_SECRET_TEXT = re.compile(
+    r"(sk-ant-[A-Za-z0-9_\-]+|sk-[A-Za-z0-9_\-]+|pplx-[A-Za-z0-9_\-]+|"
+    r"AIza[0-9A-Za-z_\-]+|AQ\.[A-Za-z0-9_\-]+|sb_secret_[A-Za-z0-9_\-]+)"
+)
+
+
+def _redact_provider_text(value: str) -> str:
+    return _SECRET_TEXT.sub("[redacted]", value)[:300]
+
+
+def _provider_error_message(response: httpx.Response) -> str:
+    """Pull a short provider error string. Credentials are stripped."""
+
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+    message = ""
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("status") or "")
+        elif isinstance(error, str):
+            message = error
+        elif isinstance(payload.get("message"), str):
+            message = payload["message"]
+    if not message:
+        message = response.text[:300]
+    return _redact_provider_text(" ".join(message.split()))
+
+
+def _provider_error_class(status_code: int, message: str) -> str:
+    """Classify Anthropic and Gemini failures the audit log needs to name."""
+
+    lowered = message.lower()
+    if status_code == 401 or "unauthorized" in lowered:
+        return "unauthorized"
+    if (
+        status_code == 403
+        or "permission_denied" in lowered
+        or "denied access" in lowered
+        or "forbidden" in lowered
+    ):
+        return "forbidden"
+    if "anthropic-workspace-id" in lowered or "not scoped to a workspace" in lowered:
+        return "workspace_required"
+    if status_code == 400 or any(
+        token in lowered
+        for token in ("schema", "invalid", "mime", "validation", "json")
+    ):
+        return "schema_validation"
+    if status_code == 429:
+        return "rate_limited"
+    return "http_error"
 
 
 def _success_result(
@@ -1132,28 +1209,22 @@ async def fetch_model_visibility(
             )
 
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-        if response.status_code == 429:
-            # No retry. A second immediate attempt makes a rate limit worse
-            # and would hold the keyword open for another full timeout.
-            _log(
-                logging.WARNING,
-                "provider rate limited",
-                provider=provider,
-                keyword=keyword,
-                status_code=429,
-                elapsed_ms=elapsed_ms,
-            )
-            return _failed_result(provider)
         if response.status_code != 200:
+            error_message = _provider_error_message(response)
+            error_class = _provider_error_class(response.status_code, error_message)
+            # 401, 403, and schema 400s are the Anthropic/Gemini failures that
+            # otherwise look identical to a timeout. The message is redacted.
             _log(
                 logging.WARNING,
                 "provider http error",
                 provider=provider,
                 keyword=keyword,
                 status_code=response.status_code,
+                error_class=error_class,
+                error_message=error_message,
                 elapsed_ms=elapsed_ms,
             )
-            return _failed_result(provider)
+            return _failed_result(provider, error_class)
 
         result = _interpret_provider_payload(
             provider,
@@ -1195,16 +1266,26 @@ async def fetch_model_visibility(
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
         return _failed_result(provider)
-    except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+        # A 200 body that is not the citation schema is a validation failure.
+        # A missing key is raised before the request and must not be labeled
+        # as a schema error.
+        message = _redact_provider_text(str(exc))
+        if "not configured" in message or "api key" in message:
+            error_class = "missing_api_key"
+        else:
+            error_class = "schema_validation"
         _log(
             logging.WARNING,
             "provider payload rejected",
             provider=provider,
             keyword=keyword,
-            error_type="payload",
+            error_class=error_class,
+            error_type=exc.__class__.__name__,
+            error_message=message,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
-        return _failed_result(provider)
+        return _failed_result(provider, error_class)
     except Exception:  # noqa: BLE001 - one provider must not cancel the others
         _log(
             logging.ERROR,
@@ -1256,12 +1337,16 @@ def _coerce_provider_result(
     source = payload.get("evaluation_source")
     if source not in {"live", "local_auditor"}:
         source = None
+    failure_reason = payload.get("failure_reason")
+    if status != "failed" or not isinstance(failure_reason, str) or not failure_reason:
+        failure_reason = None
     return ProviderResult(
         provider=provider,
         status=status,
         cited=cited,
         competitors=competitors,
         evaluation_source=source,
+        failure_reason=failure_reason,
     )
 
 
@@ -1301,11 +1386,13 @@ def calculate_keyword_metrics(provider_results: list[dict[str, Any]]) -> Keyword
     """Reduce a provider response array into the Vibe-Share Score.
 
     Score = (successful citations / successful provider responses) * 100.
-    A response counts as successful only when that provider returned a
-    usable judgment. Failures stay in the provider list for diagnosis and
-    stay out of the denominator, because a timeout is not evidence that the
-    brand is absent. The optimization sentence is attached only when the
-    score drops below 50. A score of exactly 50 does not trigger it.
+    A provider that times out, returns 401/403, or fails schema validation
+    is omitted from that ratio. Two live answers and two failures therefore
+    score the two answers, not 0/4. The score is the failure sentinel 0 only
+    when every provider failed. Zero citations among the engines that did
+    answer is a measured 0, and their competitor lists are still kept.
+    The optimization sentence is attached only when the score drops below 50.
+    A score of exactly 50 does not trigger it.
     """
 
     by_name: dict[str, dict[str, Any]] = {}
@@ -1424,11 +1511,22 @@ async def _lifespan(app: FastAPI):
         _log(logging.INFO, "visibility api stopped")
 
 
+class NewlineJSONResponse(JSONResponse):
+    """JSON bodies end with a newline so a curl result does not sit on the shell prompt."""
+
+    def render(self, content: Any) -> bytes:
+        rendered = super().render(content)
+        if rendered.endswith(b"\n"):
+            return rendered
+        return rendered + b"\n"
+
+
 app = FastAPI(
     title="AI Visibility Indexing API",
     summary="Measures how often AI answer engines cite a brand for a keyword.",
     version=VERSION,
     lifespan=_lifespan,
+    default_response_class=NewlineJSONResponse,
 )
 app.include_router(billing_router)
 
