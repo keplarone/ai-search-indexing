@@ -8,3 +8,6 @@ __pycache__/
 .python-version
 agent-tools/
 data/
+leads.json
+leads.json.tmp
+leads.json.bak
