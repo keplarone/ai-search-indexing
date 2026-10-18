@@ -298,6 +298,15 @@ def test_provider_401_is_a_fastapi_unauthorized_response(
     assert response.content.endswith(b"\n")
 
 
+def test_api_key_middle_redaction_hides_fifteen_characters() -> None:
+    secret = "sk-ant-abcdefghijklmnopqrstuvwxyz"
+    masked = main._redact_api_key_middle(secret)
+    assert secret not in masked
+    assert masked.count("*") == 15
+    assert len(masked) == len(secret)
+    assert masked.startswith(secret[: (len(secret) - 15) // 2])
+
+
 def test_provider_error_classes() -> None:
     assert main._provider_error_class(401, "Unauthorized") == "unauthorized"
     assert (

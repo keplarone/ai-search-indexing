@@ -779,6 +779,17 @@ def _redact_provider_text(value: str) -> str:
     return _SECRET_TEXT.sub("[redacted]", value)[:300]
 
 
+def _redact_api_key_middle(value: str | None) -> str:
+    """Hide the middle 15 characters of an API key before it reaches a print log."""
+
+    secret = value or ""
+    if len(secret) <= 15:
+        return "*" * len(secret)
+    start = (len(secret) - 15) // 2
+    hidden = secret[start : start + 15]
+    return secret.replace(hidden, "*" * 15, 1)
+
+
 def _provider_error_message(response: httpx.Response) -> str:
     """Pull a short provider error string. Credentials are stripped."""
 
@@ -1202,6 +1213,16 @@ async def fetch_model_visibility(
                 keyword=keyword,
                 host=urlparse(url).hostname,
             )
+            if provider == "anthropic":
+                # Temporary load check. Only the API key is masked; other
+                # header values stay visible so the workspace id can be verified.
+                safe_headers = {
+                    key: _redact_api_key_middle(value)
+                    if key.lower() in {"x-api-key", "authorization"}
+                    else value
+                    for key, value in headers.items()
+                }
+                print(f"anthropic request headers: {safe_headers}", flush=True)
             response = await _require_http_client().post(
                 url, headers=headers, json=body
             )
