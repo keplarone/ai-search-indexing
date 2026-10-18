@@ -1978,3 +1978,38 @@ if __name__ == "__main__":
         port=_port(),
         reload=_flag("RELOAD", "false"),
     )
+
+    from fastapi import BackgroundTasks, HTTPException
+from pydantic import ValidationError
+import hmac
+
+_QUICK_CHECK_KEY = "indexgrid_master_2026_pass"
+
+@app.get("/v1/quick_check")
+async def quick_check(
+    domain: str,
+    brand: str,
+    keyword: str,
+    key: str,
+    background_tasks: BackgroundTasks
+):
+    """
+    Run a single keyword visibility audit instantly via a standard browser URL.
+    """
+    if not hmac.compare_digest(key, _QUICK_CHECK_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized Master Key")
+        
+    try:
+        audit_request = AuditRequest(
+            client_domain=domain,
+            brand_name=brand,
+            keywords=[keyword]
+        )
+    except ValidationError as exc:
+        detail = "; ".join(
+            str(err.get("msg", "invalid request")).removeprefix("Value error, ")
+            for err in exc.errors()
+        )
+        raise HTTPException(status_code=422, detail=detail)
+        
+    return await create_audit(audit_request, background_tasks)
