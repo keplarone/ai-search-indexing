@@ -2,3 +2,4 @@ fastapi>=0.115.0,<1
 uvicorn>=0.32.0,<1
 httpx>=0.27.0,<1
 pydantic>=2.6.0,<3
+stripe==16.0.0

@@ -84,6 +84,16 @@ Copy `.env.example` to `.env` and export the variables before starting the proce
 
 Live prompts include the brand, domain, and keyword and are sent to the provider you configured. Keys are never written to logs. With a full live set of 15 keywords, budget a client timeout of at least 60 seconds: the in-process fan-out is concurrent, and the 15-second provider cap still applies to each call.
 
+## Billing
+
+After a successful `POST /v1/audit`, a background task reports `keywords_processed` to Stripe as a legacy usage record on the account's metered subscription item. The call is `POST /v1/subscription_items/{id}/usage_records` with `action=increment`, pinned to Stripe API version `2025-02-24.acacia`. That is the supported way to keep using usage records on stripe-python 16, which removed `stripe.UsageRecord`. The idempotency key is `idxgrid_usage_{subscription_item_id}_{timestamp}` so a network retry does not bill the same execution twice.
+
+`POST /v1/webhooks/stripe` verifies `Stripe-Signature` with `stripe.Webhook.construct_event`. `customer.subscription.created`, `customer.subscription.updated`, and `customer.subscription.deleted` write `stripe_customer_id`, `stripe_subscription_id`, `stripe_subscription_item_id`, and `subscription_status` on the Supabase `accounts` table. The table definition is `supabase/accounts.sql`. Match is on `stripe_customer_id`, with a fallback to `metadata.client_domain` when the customer id is not linked yet.
+
+Failed usage reports and failed account updates are stored in `data/billing_registry.sqlite`. `replay_failed_usage_reports()` resubmits them with the original idempotency key and usage timestamp. Set `STRIPE_API_KEY` to a restricted key (`rk_`) that can create usage records. Keep `STRIPE_WEBHOOK_SECRET` and `SUPABASE_SECRET_KEY` in a secrets vault.
+
+If you charge US or EU customers, enable Stripe Tax on the subscription price and confirm an active registration. Stripe calculates no tax until that registration exists. See [Collect taxes for recurring payments](https://docs.stripe.com/billing/taxes/collect-taxes.md).
+
 ## Tests
 
 ```bash

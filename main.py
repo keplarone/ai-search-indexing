@@ -29,8 +29,18 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from billing import (
+    bill_completed_audit,
+    billing_status,
+    start_billing,
+    stop_billing,
+)
+from billing import (
+    router as billing_router,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -421,6 +431,7 @@ class HealthResponse(BaseModel):
     provider_mode: Literal["auto", "live", "mock"]
     providers_configured: dict[str, bool]
     http_client_ready: bool
+    billing: dict[str, bool]
 
 
 class ServiceInfo(BaseModel):
@@ -431,6 +442,7 @@ class ServiceInfo(BaseModel):
     audit: str
     health: str
     docs: str
+    webhook: str
 
 
 # ---------------------------------------------------------------------------
@@ -1401,9 +1413,11 @@ async def _lifespan(app: FastAPI):
         provider_mode=_provider_mode(),
         providers_configured=configured,
     )
+    await start_billing()
     try:
         yield
     finally:
+        await stop_billing()
         if owns_client and _http_client is not None:
             await _http_client.aclose()
             _http_client = None
@@ -1416,6 +1430,7 @@ app = FastAPI(
     version=VERSION,
     lifespan=_lifespan,
 )
+app.include_router(billing_router)
 
 
 @app.get("/", response_model=ServiceInfo, tags=["meta"])
@@ -1426,6 +1441,7 @@ async def service_info() -> ServiceInfo:
         audit="/v1/audit",
         health="/health",
         docs="/docs",
+        webhook="/v1/webhooks/stripe",
     )
 
 
@@ -1436,11 +1452,14 @@ async def health() -> HealthResponse:
         provider_mode=_provider_mode(),
         providers_configured={name: bool(_api_key(name)) for name in PROVIDERS},
         http_client_ready=_http_client is not None,
+        billing=billing_status(),
     )
 
 
 @app.post("/v1/audit", response_model=AuditResponse, tags=["audit"])
-async def create_audit(request: AuditRequest) -> AuditResponse:
+async def create_audit(
+    request: AuditRequest, background_tasks: BackgroundTasks
+) -> AuditResponse:
     """Audit every keyword across OpenAI, Anthropic, Gemini, and Perplexity.
 
     The loop schedules one task per keyword. Each task gathers the four
@@ -1503,6 +1522,13 @@ async def create_audit(request: AuditRequest) -> AuditResponse:
             keyword: metrics.vibe_share_score
             for keyword, metrics in response.results.items()
         },
+    )
+    # Billing runs after the response is sent. A Stripe or Supabase failure
+    # is recorded by the billing registry and does not change this payload.
+    background_tasks.add_task(
+        bill_completed_audit,
+        request.client_domain,
+        response.keywords_processed,
     )
     return response
 
