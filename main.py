@@ -594,19 +594,17 @@ def _anthropic_request(
     ``max_tokens`` still has to leave room for that thinking.
     """
 
-    api_key = _api_key("anthropic")
+    api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
         raise ValueError("anthropic api key is not configured")
     base = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
     url = f"{base}/v1/messages"
-    # Workspace verification for the regular-workspaces preview. The key and
-    # workspace id are read at call time so a restarted process picks up .env.
     headers = {
-        "X-API-Key": os.environ.get("ANTHROPIC_API_KEY"),
+        "x-api-key": str(os.environ.get("ANTHROPIC_API_KEY")).strip(),
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "regular-workspaces-preview",
-        "anthropic-workspace-id": os.environ.get("ANTHROPIC_WORKSPACE_ID"),
-        "Content-Type": "application/json",
+        "anthropic-workspace-id": str(os.environ.get("ANTHROPIC_WORKSPACE_ID")).strip(),
+        "content-type": "application/json",
     }
     body: dict[str, Any] = {
         "model": _anthropic_model(),
@@ -1214,12 +1212,19 @@ async def fetch_model_visibility(
                 host=urlparse(url).hostname,
             )
             if provider == "anthropic":
-                # Temporary load check. Only the API key is masked; other
-                # header values stay visible so the workspace id can be verified.
+                # Built at the send site and passed straight through. The shared
+                # client does not replace this mapping; request headers win.
+                headers = {
+                    "x-api-key": str(os.environ.get("ANTHROPIC_API_KEY")).strip(),
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": "regular-workspaces-preview",
+                    "anthropic-workspace-id": str(
+                        os.environ.get("ANTHROPIC_WORKSPACE_ID")
+                    ).strip(),
+                    "content-type": "application/json",
+                }
                 safe_headers = {
-                    key: _redact_api_key_middle(value)
-                    if key.lower() in {"x-api-key", "authorization"}
-                    else value
+                    key: _redact_api_key_middle(value) if key == "x-api-key" else value
                     for key, value in headers.items()
                 }
                 print(f"anthropic request headers: {safe_headers}", flush=True)

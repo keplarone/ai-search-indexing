@@ -254,10 +254,11 @@ def test_anthropic_workspace_header_comes_from_the_environment(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_test")
     _url, headers, _body = main._anthropic_request("system", "user")
-    assert headers["X-API-Key"] == "sk-ant-test"
+    assert headers["x-api-key"] == "sk-ant-test"
     assert headers["anthropic-version"] == "2023-06-01"
     assert headers["anthropic-beta"] == "regular-workspaces-preview"
     assert headers["anthropic-workspace-id"] == "wrkspc_test"
+    assert headers["content-type"] == "application/json"
 
 
 def test_provider_401_is_a_fastapi_unauthorized_response(
@@ -270,7 +271,12 @@ def test_provider_401_is_a_fastapi_unauthorized_response(
         if host == "api.anthropic.com":
             return httpx.Response(
                 401,
-                json={"error": {"type": "authentication_error", "message": "invalid x-api-key"}},
+                json={
+                    "error": {
+                        "type": "authentication_error",
+                        "message": "invalid x-api-key",
+                    }
+                },
             )
         if host == "api.openai.com":
             return httpx.Response(200, json=_openai_body(False, []))
