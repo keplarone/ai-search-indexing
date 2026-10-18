@@ -29,7 +29,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -604,9 +604,8 @@ def _anthropic_request(
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
-    # Keys that are not scoped to one workspace are rejected until this header
-    # names the workspace. A missing value is logged as workspace_required.
-    workspace_id = _env("ANTHROPIC_WORKSPACE_ID")
+    # Unscoped keys are rejected until this header names the workspace.
+    workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID")
     if workspace_id:
         headers["anthropic-workspace-id"] = workspace_id
     body: dict[str, Any] = {
@@ -1209,11 +1208,24 @@ async def fetch_model_visibility(
             )
 
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        if response.status_code == 401:
+            error_message = _provider_error_message(response)
+            _log(
+                logging.WARNING,
+                "provider unauthorized",
+                provider=provider,
+                keyword=keyword,
+                status_code=401,
+                error_class="unauthorized",
+                error_message=error_message,
+                elapsed_ms=elapsed_ms,
+            )
+            raise HTTPException(status_code=401, detail="Unauthorized")
         if response.status_code != 200:
             error_message = _provider_error_message(response)
             error_class = _provider_error_class(response.status_code, error_message)
-            # 401, 403, and schema 400s are the Anthropic/Gemini failures that
-            # otherwise look identical to a timeout. The message is redacted.
+            # 403 and schema 400s are logged by class so Anthropic and Gemini
+            # failures are not indistinguishable from a timeout.
             _log(
                 logging.WARNING,
                 "provider http error",
@@ -1286,6 +1298,8 @@ async def fetch_model_visibility(
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
         return _failed_result(provider, error_class)
+    except HTTPException:
+        raise
     except Exception:  # noqa: BLE001 - one provider must not cancel the others
         _log(
             logging.ERROR,
@@ -1415,9 +1429,14 @@ def calculate_keyword_metrics(provider_results: list[dict[str, Any]]) -> Keyword
             payload = _failed_result(provider)
         ordered.append(_coerce_provider_result(payload, provider))
 
+    # Failed calls remain in `ordered` for the provider log. The ratio uses
+    # only responses whose status is success. 0 citations / 2 successes = 0.0.
     successful = [item for item in ordered if item.status == "success"]
     citations = [item for item in successful if item.cited]
-    score = _percentage(len(citations), len(successful))
+    if not successful:
+        score = 0.0
+    else:
+        score = _percentage(len(citations), len(successful))
 
     competitors: list[str] = []
     seen: set[str] = set()
@@ -1462,6 +1481,8 @@ async def _audit_single_keyword(
     )
     normalized: list[dict[str, Any]] = []
     for provider, raw in zip(PROVIDERS, raw_results, strict=True):
+        if isinstance(raw, HTTPException):
+            raise raw
         if isinstance(raw, Exception):
             _log(
                 logging.ERROR,
@@ -1531,6 +1552,19 @@ app = FastAPI(
 app.include_router(billing_router)
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    _request: Request, exc: HTTPException
+) -> NewlineJSONResponse:
+    """Keep error JSON on the same newline-terminated response as audit payloads."""
+
+    return NewlineJSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
+
+
 @app.get("/", response_model=ServiceInfo, tags=["meta"])
 async def service_info() -> ServiceInfo:
     return ServiceInfo(
@@ -1594,6 +1628,8 @@ async def create_audit(
 
     results: dict[str, KeywordMetrics] = {}
     for keyword, outcome in zip(request.keywords, completed, strict=True):
+        if isinstance(outcome, HTTPException):
+            raise outcome
         if isinstance(outcome, KeywordMetrics):
             results[keyword] = outcome
             continue

@@ -248,6 +248,53 @@ def test_measured_zero_keeps_competitor_evidence() -> None:
     assert metrics.providers[1].failure_reason is None
 
 
+def test_anthropic_workspace_header_comes_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_test")
+    _url, headers, _body = main._anthropic_request("system", "user")
+    assert headers["anthropic-workspace-id"] == "wrkspc_test"
+
+
+def test_provider_401_is_a_fastapi_unauthorized_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _live_keys(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host == "api.anthropic.com":
+            return httpx.Response(
+                401,
+                json={"error": {"type": "authentication_error", "message": "invalid x-api-key"}},
+            )
+        if host == "api.openai.com":
+            return httpx.Response(200, json=_openai_body(False, []))
+        if host == "generativelanguage.googleapis.com":
+            return httpx.Response(200, json=_gemini_body(False, []))
+        if host == "api.perplexity.ai":
+            return httpx.Response(200, json=_perplexity_body(False, []))
+        raise AssertionError(host)
+
+    client = _install_transport(handler)
+    try:
+        with TestClient(main.app) as api:
+            response = api.post(
+                "/v1/audit",
+                json={
+                    "client_domain": "example.com",
+                    "brand_name": "Example",
+                    "keywords": ["widgets"],
+                },
+            )
+    finally:
+        _close_transport(client)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Unauthorized"
+    assert response.content.endswith(b"\n")
+
+
 def test_provider_error_classes() -> None:
     assert main._provider_error_class(401, "Unauthorized") == "unauthorized"
     assert (
