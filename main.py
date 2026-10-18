@@ -43,6 +43,7 @@ from billing import (
 from billing import (
     router as billing_router,
 )
+from routes.tokens import router as tokens_router
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1799,6 +1800,7 @@ app = FastAPI(
     default_response_class=NewlineJSONResponse,
 )
 app.include_router(billing_router)
+app.include_router(tokens_router, prefix="/v1/tokens")
 
 
 @app.exception_handler(HTTPException)
