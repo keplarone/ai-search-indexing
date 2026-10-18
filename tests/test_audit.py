@@ -254,6 +254,9 @@ def test_anthropic_workspace_header_comes_from_the_environment(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_test")
     _url, headers, _body = main._anthropic_request("system", "user")
+    assert headers["X-API-Key"] == "sk-ant-test"
+    assert headers["anthropic-version"] == "2023-06-01"
+    assert headers["anthropic-beta"] == "regular-workspaces-preview"
     assert headers["anthropic-workspace-id"] == "wrkspc_test"
 
 
@@ -590,8 +593,9 @@ def test_live_requests_send_the_system_prompt_and_hide_the_gemini_key(
     assert captured["api.anthropic.com"].headers["x-api-key"] == "sk-test-anthropic"
 
     gemini_request = captured["generativelanguage.googleapis.com"]
-    assert "key" not in gemini_request.url.params
-    assert gemini_request.headers["x-goog-api-key"] == "sk-test-gemini"
+    assert gemini_request.url.host == "generativelanguage.googleapis.com"
+    assert gemini_request.url.params["key"] == "sk-test-gemini"
+    assert "x-goog-api-key" not in gemini_request.headers
     gemini_body = json.loads(gemini_request.content)
     assert "temperature" not in gemini_body["generationConfig"]
     assert gemini_body["generationConfig"]["responseMimeType"] == "application/json"

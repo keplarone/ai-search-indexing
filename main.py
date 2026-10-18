@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -599,15 +599,15 @@ def _anthropic_request(
         raise ValueError("anthropic api key is not configured")
     base = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
     url = f"{base}/v1/messages"
+    # Workspace verification for the regular-workspaces preview. The key and
+    # workspace id are read at call time so a restarted process picks up .env.
     headers = {
-        "x-api-key": api_key,
+        "X-API-Key": os.environ.get("ANTHROPIC_API_KEY"),
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "regular-workspaces-preview",
+        "anthropic-workspace-id": os.environ.get("ANTHROPIC_WORKSPACE_ID"),
         "Content-Type": "application/json",
     }
-    # Unscoped keys are rejected until this header names the workspace.
-    workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID")
-    if workspace_id:
-        headers["anthropic-workspace-id"] = workspace_id
     body: dict[str, Any] = {
         "model": _anthropic_model(),
         "max_tokens": 2048,
@@ -667,8 +667,8 @@ def _gemini_request(
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
     """Build a Gemini generateContent request.
 
-    The API key travels in ``x-goog-api-key`` rather than the query string.
-    Query-string keys leak into traces, exception URLs, and access logs.
+    The key is the ``key`` query parameter on the standard Generative Language
+    host. Callers log the hostname only, never the full URL.
     """
 
     api_key = _api_key("gemini")
@@ -678,9 +678,8 @@ def _gemini_request(
     base = _env("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com").rstrip(
         "/"
     )
-    url = f"{base}/v1beta/models/{model}:generateContent"
+    url = f"{base}/v1beta/models/{model}:generateContent?key={quote_plus(api_key)}"
     headers = {
-        "x-goog-api-key": api_key,
         "Content-Type": "application/json",
     }
     body: dict[str, Any] = {
